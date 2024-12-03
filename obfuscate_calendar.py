@@ -1,3 +1,4 @@
+from pytz import timezone  # For handling time zones
 import os
 import pickle
 import caldav
@@ -55,17 +56,38 @@ GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
 def convert_recurrence(event):
     recurrence = []
     if hasattr(event, "rrule"):
-        rrule = event.rrule.to_ical().decode("utf-8").strip()
+        # Access the recurrence rule directly
+        rrule = event.rrule.value
+        # Convert the rule to a string format acceptable by Google Calendar
         recurrence.append(f"RRULE:{rrule}")
     return recurrence
 
 
 # Function to obfuscate event details
 def obfuscate_event(event):
+    # Default to PST if no timezone is found
+    default_timezone = "America/Los_Angeles"  # PST timezone identifier
+    start_dt = event.vobject_instance.vevent.dtstart.value
+    end_dt = event.vobject_instance.vevent.dtend.value
+
+    # Ensure tzinfo is valid or fallback to default
+    start_timezone = (
+        start_dt.tzinfo.zone if hasattr(start_dt.tzinfo, "zone") else default_timezone
+    )
+    end_timezone = (
+        end_dt.tzinfo.zone if hasattr(end_dt.tzinfo, "zone") else default_timezone
+    )
+
     event_body = {
         "summary": "Busy",
-        "start": {"dateTime": event.vobject_instance.vevent.dtstart.value.isoformat()},
-        "end": {"dateTime": event.vobject_instance.vevent.dtend.value.isoformat()},
+        "start": {
+            "dateTime": start_dt.isoformat(),
+            "timeZone": start_timezone,
+        },
+        "end": {
+            "dateTime": end_dt.isoformat(),
+            "timeZone": end_timezone,
+        },
         "transparency": "opaque",
         # Store the iCloud event UID in extended properties
         "extendedProperties": {
