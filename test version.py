@@ -5,7 +5,7 @@ import pickle
 import caldav
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import constants  # Contains ICLOUD_USERNAME and ICLOUD_PASSWORD
+import constants  # Contains ICLOUD_USERNAME, ICLOUD_PASSWORD, and GOOGLE_CALENDAR_ID
 from google.auth.transport.requests import Request
 import time
 
@@ -75,7 +75,7 @@ def convert_recurrence(event):
         recurrence.append(f"RRULE:{rrule}")
     return recurrence
 
-# Function to obfuscate event details
+# Function to obfuscate event details and include iCloud ETag
 def obfuscate_event(event):
     # Default to PST if no timezone is found
     default_timezone = "America/Los_Angeles"  # PST timezone identifier
@@ -122,7 +122,10 @@ def obfuscate_event(event):
         } if end_timezone else {"date": end_time},
         "transparency": "opaque",
         "extendedProperties": {
-            "private": {"icloud_uid": event.vobject_instance.vevent.uid.value}
+            "private": {
+                "icloud_uid": event.vobject_instance.vevent.uid.value,
+                "icloud_etag": event.etag  # Store the ETag
+            }
         },
     }
 
@@ -132,7 +135,7 @@ def obfuscate_event(event):
 
     return event_body
 
-# Build a map of iCloud UIDs to Google Event IDs
+# Build a map of iCloud UIDs to Google Event IDs, including extendedProperties
 def build_google_event_map():
     page_token = None
     google_events = {}
@@ -148,8 +151,7 @@ def build_google_event_map():
             if icloud_uid:
                 google_events[icloud_uid] = {
                     "id": event["id"],
-                    "start": event.get("start"),
-                    "end": event.get("end"),
+                    "extendedProperties": event.get("extendedProperties"),
                 }
             else:
                 # Optionally log events without icloud_uid for debugging
@@ -181,13 +183,22 @@ else:
             continue
         print(f"Processing calendar: {calendar.name}")
         try:
+            # Fetch events without including ETag
             events = calendar.events()
             print(f"Retrieved {len(events)} events from iCloud calendar {calendar.name}")
+            # Get ETag for each event
+            for event in events:
+                # Ensure the event is loaded
+                event.load()
+                # Fetch the ETag property
+                props = event.get_properties([caldav.dav.GetEtag()])
+                event.etag = props.get('{DAV:}getetag', None)
             calendars_events[calendar.name] = events
         except Exception as e:
             print(f"Could not fetch events for calendar {calendar.name}: {e}")
             continue
     save_cache(ICLOUD_EVENTS_CACHE, calendars_events)
+
 
 # Keep track of iCloud UIDs processed
 processed_icloud_uids = set()
@@ -198,33 +209,32 @@ for calendar_name, events in calendars_events.items():
     # Process each iCloud event
     for event in events:
         icloud_uid = event.vobject_instance.vevent.uid.value
+        icloud_etag = event.etag
         print(f"Processing iCloud event UID: {icloud_uid}")
         obfuscated_event = obfuscate_event(event)
         processed_icloud_uids.add(icloud_uid)
         if icloud_uid in google_event_map:
-            # Update existing event in Google Calendar if necessary
-            event_id = google_event_map[icloud_uid]["id"]
-            existing_event_start = google_event_map[icloud_uid].get("start")
-            existing_event_end = google_event_map[icloud_uid].get("end")
-            new_event_start = obfuscated_event["start"]
-            new_event_end = obfuscated_event["end"]
+            # Retrieve the stored ETag from Google Calendar event
+            google_event = google_event_map[icloud_uid]
+            google_etag = google_event.get("extendedProperties", {}).get("private", {}).get("icloud_etag")
 
-            # Compare start and end times
-            if existing_event_start == new_event_start and existing_event_end == new_event_end:
-                print(f"No changes detected for event {event_id}; skipping update.")
-                # Remove from map to avoid deletion later
-                del google_event_map[icloud_uid]
+            if icloud_etag == google_etag:
+                print(f"No changes detected for event {google_event['id']}; skipping update.")
                 continue
 
-            print(f"Updating event: {event_id} with icloud_uid: {icloud_uid}")
+            # Update existing event in Google Calendar
+            print(f"Updating event: {google_event['id']} with icloud_uid: {icloud_uid}")
             try:
-                service.events().update(
-                    calendarId=GOOGLE_CALENDAR_ID, eventId=event_id, body=obfuscated_event
+                updated_event = service.events().update(
+                    calendarId=GOOGLE_CALENDAR_ID, eventId=google_event['id'], body=obfuscated_event
                 ).execute()
-                # Remove from map to avoid deletion later
-                del google_event_map[icloud_uid]
+                # Update google_event_map with new extendedProperties
+                google_event_map[icloud_uid] = {
+                    "id": updated_event["id"],
+                    "extendedProperties": updated_event.get("extendedProperties"),
+                }
             except Exception as e:
-                print(f"Error updating event {event_id}: {e}")
+                print(f"Error updating event {google_event['id']}: {e}")
         else:
             # Create new event in Google Calendar
             print(f"Creating new event with icloud_uid: {icloud_uid}")
@@ -235,20 +245,25 @@ for calendar_name, events in calendars_events.items():
                 # Add to google_event_map
                 google_event_map[icloud_uid] = {
                     "id": created_event["id"],
-                    "start": created_event.get("start"),
-                    "end": created_event.get("end"),
+                    "extendedProperties": created_event.get("extendedProperties"),
                 }
             except Exception as e:
                 print(f"Error creating event with icloud_uid {icloud_uid}: {e}")
 
 # Delete events from Google Calendar that no longer exist in iCloud
-for icloud_uid, event_info in google_event_map.items():
+icloud_uids_in_google = set(google_event_map.keys())
+icloud_uids_not_in_icloud = icloud_uids_in_google - processed_icloud_uids
+
+for icloud_uid in icloud_uids_not_in_icloud:
+    event_info = google_event_map[icloud_uid]
     event_id = event_info["id"]
     print(f"Deleting event with icloud_uid: {icloud_uid}")
     try:
         service.events().delete(
             calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
         ).execute()
+        # Remove from google_event_map
+        del google_event_map[icloud_uid]
     except Exception as e:
         print(f"Error deleting event {event_id}: {e}")
 
