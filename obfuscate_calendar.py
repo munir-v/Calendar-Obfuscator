@@ -1,3 +1,4 @@
+from datetime import datetime, date
 from pytz import timezone  # For handling time zones
 import os
 import pickle
@@ -9,7 +10,9 @@ from google.auth.transport.requests import Request
 import pickle
 import os
 from google_auth_oauthlib.flow import InstalledAppFlow
+import time
 
+start_time = time.time()
 
 # Connect to iCloud via CalDAV
 client = caldav.DAVClient(
@@ -70,35 +73,55 @@ def obfuscate_event(event):
     start_dt = event.vobject_instance.vevent.dtstart.value
     end_dt = event.vobject_instance.vevent.dtend.value
 
-    # Ensure tzinfo is valid or fallback to default
-    start_timezone = (
-        start_dt.tzinfo.zone if hasattr(start_dt.tzinfo, "zone") else default_timezone
-    )
-    end_timezone = (
-        end_dt.tzinfo.zone if hasattr(end_dt.tzinfo, "zone") else default_timezone
-    )
+    # Function to extract timezone name
+    def get_timezone_name(tzinfo):
+        if tzinfo:
+            try:
+                # Extract standard timezone name
+                if hasattr(tzinfo, 'zone'):
+                    return tzinfo.zone
+                # Handle non-standard timezones (e.g., _tzicalvtz)
+                return str(tzinfo).split("'")[1] if "'" in str(tzinfo) else default_timezone
+            except (AttributeError, IndexError):
+                pass
+        return default_timezone
+
+    # Handle start and end times
+    if isinstance(start_dt, datetime):
+        start_timezone = get_timezone_name(start_dt.tzinfo)
+        start_time = start_dt.isoformat()
+    else:
+        start_timezone = None  # No timezone for all-day events
+        start_time = start_dt.isoformat()
+
+    if isinstance(end_dt, datetime):
+        end_timezone = get_timezone_name(end_dt.tzinfo)
+        end_time = end_dt.isoformat()
+    else:
+        end_timezone = None  # No timezone for all-day events
+        end_time = end_dt.isoformat()
 
     event_body = {
         "summary": "Busy",
         "start": {
-            "dateTime": start_dt.isoformat(),
-            "timeZone": start_timezone,
-        },
+            "dateTime": start_time,
+            "timeZone": start_timezone if start_timezone else default_timezone,
+        } if start_timezone else {"date": start_time},
         "end": {
-            "dateTime": end_dt.isoformat(),
-            "timeZone": end_timezone,
-        },
+            "dateTime": end_time,
+            "timeZone": end_timezone if end_timezone else default_timezone,
+        } if end_timezone else {"date": end_time},
         "transparency": "opaque",
-        # Store the iCloud event UID in extended properties
         "extendedProperties": {
             "private": {"icloud_uid": event.vobject_instance.vevent.uid.value}
         },
     }
+
     # Add recurrence if available
     if hasattr(event.vobject_instance.vevent, "rrule"):
         event_body["recurrence"] = convert_recurrence(event.vobject_instance.vevent)
-    return event_body
 
+    return event_body
 
 # Build a map of iCloud UIDs to Google Event IDs
 def build_google_event_map():
@@ -127,8 +150,6 @@ def build_google_event_map():
 # Process all iCloud calendars
 for calendar in calendars:
     if calendar.name.startswith("Reminders"):
-        continue
-    elif not calendar.name.startswith("Deep"):
         continue
     print(f"Processing calendar: {calendar.name}")
     try:
@@ -160,7 +181,7 @@ for calendar in calendars:
                 .insert(calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event)
                 .execute()
             )
-            print(f"Created event in Google Calendar: {created_event}")
+            # print(f"Created event in Google Calendar: {created_event}")
 
     # Delete events from Google Calendar that no longer exist in iCloud
     for icloud_uid, event_id in google_event_map.items():
@@ -169,3 +190,8 @@ for calendar in calendars:
         ).execute()
 
 print("Synchronization complete.")
+
+end_time = time.time()  # Record the end time
+elapsed_time = end_time - start_time  # Calculate the elapsed time
+
+print(f"Script took {elapsed_time:.2f} seconds to run.")
