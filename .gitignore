@@ -7,3 +7,4 @@ constants.py
 credentials.json
 *.pickle
 *.log
+*.pkl
