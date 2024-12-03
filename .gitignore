@@ -5,3 +5,4 @@ __pycache__/
 constants.py
 *.txt
 credentials.json
+*.pickle
