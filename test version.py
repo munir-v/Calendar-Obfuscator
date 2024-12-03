@@ -146,7 +146,11 @@ def build_google_event_map():
         for event in events_result.get("items", []):
             icloud_uid = event.get("extendedProperties", {}).get("private", {}).get("icloud_uid")
             if icloud_uid:
-                google_events[icloud_uid] = event["id"]
+                google_events[icloud_uid] = {
+                    "id": event["id"],
+                    "start": event.get("start"),
+                    "end": event.get("end"),
+                }
             else:
                 # Optionally log events without icloud_uid for debugging
                 print(f"Event without icloud_uid: {event['id']} - {event.get('summary')}")
@@ -198,8 +202,20 @@ for calendar_name, events in calendars_events.items():
         obfuscated_event = obfuscate_event(event)
         processed_icloud_uids.add(icloud_uid)
         if icloud_uid in google_event_map:
-            # Update existing event in Google Calendar
-            event_id = google_event_map[icloud_uid]
+            # Update existing event in Google Calendar if necessary
+            event_id = google_event_map[icloud_uid]["id"]
+            existing_event_start = google_event_map[icloud_uid].get("start")
+            existing_event_end = google_event_map[icloud_uid].get("end")
+            new_event_start = obfuscated_event["start"]
+            new_event_end = obfuscated_event["end"]
+
+            # Compare start and end times
+            if existing_event_start == new_event_start and existing_event_end == new_event_end:
+                print(f"No changes detected for event {event_id}; skipping update.")
+                # Remove from map to avoid deletion later
+                del google_event_map[icloud_uid]
+                continue
+
             print(f"Updating event: {event_id} with icloud_uid: {icloud_uid}")
             try:
                 service.events().update(
@@ -217,12 +233,17 @@ for calendar_name, events in calendars_events.items():
                     calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event
                 ).execute()
                 # Add to google_event_map
-                google_event_map[icloud_uid] = created_event['id']
+                google_event_map[icloud_uid] = {
+                    "id": created_event["id"],
+                    "start": created_event.get("start"),
+                    "end": created_event.get("end"),
+                }
             except Exception as e:
                 print(f"Error creating event with icloud_uid {icloud_uid}: {e}")
 
 # Delete events from Google Calendar that no longer exist in iCloud
-for icloud_uid, event_id in google_event_map.items():
+for icloud_uid, event_info in google_event_map.items():
+    event_id = event_info["id"]
     print(f"Deleting event with icloud_uid: {icloud_uid}")
     try:
         service.events().delete(
