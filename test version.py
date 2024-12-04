@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from pytz import timezone  # For handling time zones
 import os
 import pickle
@@ -8,25 +8,34 @@ from googleapiclient.discovery import build
 import constants  # Contains ICLOUD_USERNAME, ICLOUD_PASSWORD, and GOOGLE_CALENDAR_ID
 from google.auth.transport.requests import Request
 import time
+import logging
+
+CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
+
+# Suppress warnings from the vobject library
+logging.getLogger("root").setLevel(logging.ERROR)
 
 start_time = time.time()
 
 # Cache settings
-CACHE_EXPIRATION_SECONDS = 300  # 5 minutes
-ICLOUD_EVENTS_CACHE = 'icloud_events_cache.pkl'
-GOOGLE_EVENTS_CACHE = 'google_event_map_cache.pkl'
+CACHE_EXPIRATION_SECONDS = 3  # 5 minutes
+ICLOUD_EVENTS_CACHE = "icloud_events_cache.pkl"
+GOOGLE_EVENTS_CACHE = "google_event_map_cache.pkl"
+
 
 def load_cache(cache_file, expiration_seconds):
     if os.path.exists(cache_file):
         cache_mtime = os.path.getmtime(cache_file)
         if time.time() - cache_mtime < expiration_seconds:
-            with open(cache_file, 'rb') as f:
+            with open(cache_file, "rb") as f:
                 return pickle.load(f)
     return None
 
+
 def save_cache(cache_file, data):
-    with open(cache_file, 'wb') as f:
+    with open(cache_file, "wb") as f:
         pickle.dump(data, f)
+
 
 # Connect to iCloud via CalDAV
 client = caldav.DAVClient(
@@ -39,6 +48,7 @@ calendars = principal.calendars()
 
 TOKEN_FILE = "token.pickle"
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
 
 def authenticate_google():
     creds = None
@@ -58,12 +68,14 @@ def authenticate_google():
             pickle.dump(creds, token)
     return creds
 
+
 # Authenticate and build the Google Calendar service
 creds = authenticate_google()
 service = build("calendar", "v3", credentials=creds)
 
 # Define the Google Calendar ID (adjust as needed)
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
+
 
 # Function to convert iCloud recurrence rules to Google Calendar format
 def convert_recurrence(event):
@@ -74,6 +86,7 @@ def convert_recurrence(event):
         # Convert the rule to a string format acceptable by Google Calendar
         recurrence.append(f"RRULE:{rrule}")
     return recurrence
+
 
 # Function to obfuscate event details and include iCloud ETag
 def obfuscate_event(event):
@@ -87,10 +100,14 @@ def obfuscate_event(event):
         if tzinfo:
             try:
                 # Extract standard timezone name
-                if hasattr(tzinfo, 'zone'):
+                if hasattr(tzinfo, "zone"):
                     return tzinfo.zone
                 # Handle non-standard timezones (e.g., _tzicalvtz)
-                return str(tzinfo).split("'")[1] if "'" in str(tzinfo) else default_timezone
+                return (
+                    str(tzinfo).split("'")[1]
+                    if "'" in str(tzinfo)
+                    else default_timezone
+                )
             except (AttributeError, IndexError):
                 pass
         return default_timezone
@@ -112,19 +129,27 @@ def obfuscate_event(event):
 
     event_body = {
         "summary": "Busy",
-        "start": {
-            "dateTime": start_time,
-            "timeZone": start_timezone if start_timezone else default_timezone,
-        } if start_timezone else {"date": start_time},
-        "end": {
-            "dateTime": end_time,
-            "timeZone": end_timezone if end_timezone else default_timezone,
-        } if end_timezone else {"date": end_time},
+        "start": (
+            {
+                "dateTime": start_time,
+                "timeZone": start_timezone if start_timezone else default_timezone,
+            }
+            if start_timezone
+            else {"date": start_time}
+        ),
+        "end": (
+            {
+                "dateTime": end_time,
+                "timeZone": end_timezone if end_timezone else default_timezone,
+            }
+            if end_timezone
+            else {"date": end_time}
+        ),
         "transparency": "opaque",
         "extendedProperties": {
             "private": {
                 "icloud_uid": event.vobject_instance.vevent.uid.value,
-                "icloud_etag": event.etag  # Store the ETag
+                "icloud_etag": event.etag,  # Store the ETag
             }
         },
     }
@@ -135,19 +160,28 @@ def obfuscate_event(event):
 
     return event_body
 
+
 # Build a map of iCloud UIDs to Google Event IDs, including extendedProperties
 def build_google_event_map():
     page_token = None
     google_events = {}
+    now = datetime.utcnow().isoformat() + "Z"  # 'Z' indicates UTC time
     while True:
-        events_result = service.events().list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            pageToken=page_token,
-            singleEvents=False,
-            maxResults=2500
-        ).execute()
+        events_result = (
+            service.events()
+            .list(
+                calendarId=GOOGLE_CALENDAR_ID,
+                pageToken=page_token,
+                singleEvents=False,
+                maxResults=2500,
+                timeMin=now,  # Only get events starting from the current date
+            )
+            .execute()
+        )
         for event in events_result.get("items", []):
-            icloud_uid = event.get("extendedProperties", {}).get("private", {}).get("icloud_uid")
+            icloud_uid = (
+                event.get("extendedProperties", {}).get("private", {}).get("icloud_uid")
+            )
             if icloud_uid:
                 google_events[icloud_uid] = {
                     "id": event["id"],
@@ -155,11 +189,13 @@ def build_google_event_map():
                 }
             else:
                 # Optionally log events without icloud_uid for debugging
-                print(f"Event without icloud_uid: {event['id']} - {event.get('summary')}")
+                pass
+                # print(f"Event without icloud_uid: {event['id']} - {event.get('summary')}")
         page_token = events_result.get("nextPageToken")
         if not page_token:
             break
     return google_events
+
 
 # Load or build the Google event map
 google_event_map = load_cache(GOOGLE_EVENTS_CACHE, CACHE_EXPIRATION_SECONDS)
@@ -178,27 +214,32 @@ if icloud_events_cache is not None:
 else:
     print("Fetching iCloud events.")
     calendars_events = {}
+    now = datetime.now(timezone("UTC"))
+    future_date = now + timedelta(days=90)  # Adjust as needed
     for calendar in calendars:
         if calendar.name.startswith("Reminders"):
             continue
-        print(f"Processing calendar: {calendar.name}")
+        if calendar.name in CALENDARS_TO_SKIP:
+            # print(f"Skipping calendar: {calendar.name}")
+            continue
         try:
-            # Fetch events without including ETag
-            events = calendar.events()
-            print(f"Retrieved {len(events)} events from iCloud calendar {calendar.name}")
+            # Fetch events starting from the current date
+            events = calendar.date_search(start=now, end=future_date)
+            print(
+                f"Processing calendar {calendar.name}: Retrieved {len(events)} events."
+            )
             # Get ETag for each event
             for event in events:
                 # Ensure the event is loaded
                 event.load()
                 # Fetch the ETag property
                 props = event.get_properties([caldav.dav.GetEtag()])
-                event.etag = props.get('{DAV:}getetag', None)
+                event.etag = props.get("{DAV:}getetag", None)
             calendars_events[calendar.name] = events
         except Exception as e:
             print(f"Could not fetch events for calendar {calendar.name}: {e}")
             continue
     save_cache(ICLOUD_EVENTS_CACHE, calendars_events)
-
 
 # Keep track of iCloud UIDs processed
 processed_icloud_uids = set()
@@ -216,18 +257,30 @@ for calendar_name, events in calendars_events.items():
         if icloud_uid in google_event_map:
             # Retrieve the stored ETag from Google Calendar event
             google_event = google_event_map[icloud_uid]
-            google_etag = google_event.get("extendedProperties", {}).get("private", {}).get("icloud_etag")
+            google_etag = (
+                google_event.get("extendedProperties", {})
+                .get("private", {})
+                .get("icloud_etag")
+            )
 
             if icloud_etag == google_etag:
-                print(f"No changes detected for event {google_event['id']}; skipping update.")
+                print(
+                    f"No changes detected for event {google_event['id']}; skipping update."
+                )
                 continue
 
             # Update existing event in Google Calendar
             print(f"Updating event: {google_event['id']} with icloud_uid: {icloud_uid}")
             try:
-                updated_event = service.events().update(
-                    calendarId=GOOGLE_CALENDAR_ID, eventId=google_event['id'], body=obfuscated_event
-                ).execute()
+                updated_event = (
+                    service.events()
+                    .update(
+                        calendarId=GOOGLE_CALENDAR_ID,
+                        eventId=google_event["id"],
+                        body=obfuscated_event,
+                    )
+                    .execute()
+                )
                 # Update google_event_map with new extendedProperties
                 google_event_map[icloud_uid] = {
                     "id": updated_event["id"],
@@ -239,9 +292,11 @@ for calendar_name, events in calendars_events.items():
             # Create new event in Google Calendar
             print(f"Creating new event with icloud_uid: {icloud_uid}")
             try:
-                created_event = service.events().insert(
-                    calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event
-                ).execute()
+                created_event = (
+                    service.events()
+                    .insert(calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event)
+                    .execute()
+                )
                 # Add to google_event_map
                 google_event_map[icloud_uid] = {
                     "id": created_event["id"],
