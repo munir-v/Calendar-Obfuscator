@@ -11,6 +11,7 @@ import time
 import logging
 
 CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
+CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.CALENDARS_ALLOW_FULL_DAY_EVENTS
 
 # Suppress warnings from the vobject library
 logging.getLogger("root").setLevel(logging.ERROR)
@@ -161,6 +162,12 @@ def obfuscate_event(event):
     return event_body
 
 
+# Function to check if an event is an all-day event
+def is_all_day_event(event):
+    start_dt = event.vobject_instance.vevent.dtstart.value
+    return not isinstance(start_dt, datetime)
+
+
 # Build a map of iCloud UIDs to Google Event IDs, including extendedProperties
 def build_google_event_map():
     page_token = None
@@ -249,6 +256,14 @@ for calendar_name, events in calendars_events.items():
     print(f"Processing calendar: {calendar_name}")
     # Process each iCloud event
     for event in events:
+        # Check if the event is an all-day event
+        if is_all_day_event(event):
+            # It's an all-day event
+            if calendar_name not in CALENDARS_ALLOW_FULL_DAY_EVENTS:
+                # Ignore the event
+                print(f"Ignoring all-day event in calendar {calendar_name}")
+                continue  # Skip to the next event
+        # Proceed with processing the event
         icloud_uid = event.vobject_instance.vevent.uid.value
         icloud_etag = event.etag
         print(f"Processing iCloud event UID: {icloud_uid}")
