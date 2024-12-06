@@ -12,6 +12,8 @@ import logging
 
 CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
 CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.CALENDARS_ALLOW_FULL_DAY_EVENTS
+DAYS_TO_SYNC = 10
+
 
 # Suppress warnings from the vobject library
 logging.getLogger("root").setLevel(logging.ERROR)
@@ -222,7 +224,7 @@ else:
     print("Fetching iCloud events.")
     calendars_events = {}
     now = datetime.now(timezone("UTC"))
-    future_date = now + timedelta(days=90)  # Adjust as needed
+    future_date = now + timedelta(days=DAYS_TO_SYNC)  # Adjust as needed
     for calendar in calendars:
         if calendar.name.startswith("Reminders"):
             continue
