@@ -1,7 +1,7 @@
 # Calendar-Obfuscator
 
 ### Description
-Integrating your calendar with services like Calendly or Zoom requires granting full access to read, write, and delete your calendar events. This script creates an obfuscated copy of your iCloud calendar, sharing it with a Google Calendar account, which can then be shared with third-party services. 
+Integrating your calendar with services like Calendly or Zoom requires granting full access to read, write, and delete your calendar events. This script creates an obfuscated copy of your iCloud calendar (by default 10 days into the future), sharing it with a(n ideally burner) Google Calendar account, which can then be shared with third-party services. 
 
 The script copies all events from your iCloud calendar from the present to a future date to your Google Calendar, deleting all events before the present. The script also obfuscates the event titles and descriptions.
 
