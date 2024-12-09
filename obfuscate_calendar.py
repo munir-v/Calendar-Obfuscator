@@ -14,31 +14,10 @@ CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
 CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.CALENDARS_ALLOW_FULL_DAY_EVENTS
 DAYS_TO_SYNC = 10
 
-
 # Suppress warnings from the vobject library
 logging.getLogger("root").setLevel(logging.ERROR)
 
 start_time = time.time()
-
-# Cache settings
-CACHE_EXPIRATION_SECONDS = 3  # 5 minutes
-ICLOUD_EVENTS_CACHE = "icloud_events_cache.pkl"
-GOOGLE_EVENTS_CACHE = "google_event_map_cache.pkl"
-
-
-def load_cache(cache_file, expiration_seconds):
-    if os.path.exists(cache_file):
-        cache_mtime = os.path.getmtime(cache_file)
-        if time.time() - cache_mtime < expiration_seconds:
-            with open(cache_file, "rb") as f:
-                return pickle.load(f)
-    return None
-
-
-def save_cache(cache_file, data):
-    with open(cache_file, "wb") as f:
-        pickle.dump(data, f)
-
 
 # Connect to iCloud via CalDAV
 client = caldav.DAVClient(
@@ -78,7 +57,6 @@ service = build("calendar", "v3", credentials=creds)
 
 # Define the Google Calendar ID (adjust as needed)
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
-# After building the Google Calendar service
 
 # Delete all events before the present
 now = datetime.now(timezone.utc).isoformat()
@@ -124,14 +102,11 @@ def obfuscate_event(event):
     start_dt = event.vobject_instance.vevent.dtstart.value
     end_dt = event.vobject_instance.vevent.dtend.value
 
-    # Function to extract timezone name
     def get_timezone_name(tzinfo):
         if tzinfo:
             try:
-                # Extract standard timezone name
                 if hasattr(tzinfo, "zone"):
                     return tzinfo.zone
-                # Handle non-standard timezones (e.g., _tzicalvtz)
                 return (
                     str(tzinfo).split("'")[1]
                     if "'" in str(tzinfo)
@@ -141,7 +116,6 @@ def obfuscate_event(event):
                 pass
         return default_timezone
 
-    # Handle start and end times
     if isinstance(start_dt, datetime):
         start_timezone = get_timezone_name(start_dt.tzinfo)
         start_time = start_dt.isoformat()
@@ -178,12 +152,11 @@ def obfuscate_event(event):
         "extendedProperties": {
             "private": {
                 "icloud_uid": event.vobject_instance.vevent.uid.value,
-                "icloud_etag": event.etag,  # Store the ETag
+                "icloud_etag": event.etag,
             }
         },
     }
 
-    # Add recurrence if available
     if hasattr(event.vobject_instance.vevent, "rrule"):
         event_body["recurrence"] = convert_recurrence(event.vobject_instance.vevent)
 
@@ -200,9 +173,7 @@ def is_all_day_event(event):
 def build_google_event_map():
     page_token = None
     google_events = {}
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()  # 'Z' indicates UTC time no longer needed
+    now = datetime.now(timezone.utc).isoformat()
     while True:
         events_result = (
             service.events()
@@ -211,7 +182,7 @@ def build_google_event_map():
                 pageToken=page_token,
                 singleEvents=False,
                 maxResults=2500,
-                timeMin=now,  # Only get events starting from the current date
+                timeMin=now,
             )
             .execute()
         )
@@ -224,84 +195,51 @@ def build_google_event_map():
                     "id": event["id"],
                     "extendedProperties": event.get("extendedProperties"),
                 }
-            else:
-                # Optionally log events without icloud_uid for debugging
-                pass
-                # print(f"Event without icloud_uid: {event['id']} - {event.get('summary')}")
         page_token = events_result.get("nextPageToken")
         if not page_token:
             break
     return google_events
 
 
-# Load or build the Google event map
-google_event_map = load_cache(GOOGLE_EVENTS_CACHE, CACHE_EXPIRATION_SECONDS)
-if google_event_map is not None:
-    print("Using cached Google events.")
-else:
-    print("Fetching Google events.")
-    google_event_map = build_google_event_map()
-    save_cache(GOOGLE_EVENTS_CACHE, google_event_map)
+print("Fetching Google events.")
+google_event_map = build_google_event_map()
 
-# Load or fetch iCloud events
-icloud_events_cache = load_cache(ICLOUD_EVENTS_CACHE, CACHE_EXPIRATION_SECONDS)
-if icloud_events_cache is not None:
-    print("Using cached iCloud events.")
-    calendars_events = icloud_events_cache
-else:
-    print("Fetching iCloud events.")
-    calendars_events = {}
-    # Use pytz.timezone to avoid overshadowing 'timezone'
-    now = datetime.now(pytz.timezone("UTC"))
-    future_date = now + timedelta(days=DAYS_TO_SYNC)  # Adjust as needed
-    for calendar in calendars:
-        if calendar.name.startswith("Reminders"):
-            continue
-        if calendar.name in CALENDARS_TO_SKIP:
-            # print(f"Skipping calendar: {calendar.name}")
-            continue
-        try:
-            # Fetch events starting from the current date
-            events = calendar.date_search(start=now, end=future_date)
-            print(
-                f"Processing calendar {calendar.name}: Retrieved {len(events)} events."
-            )
-            # Get ETag for each event
-            for event in events:
-                # Ensure the event is loaded
-                event.load()
-                # Fetch the ETag property
-                props = event.get_properties([caldav.dav.GetEtag()])
-                event.etag = props.get("{DAV:}getetag", None)
-            calendars_events[calendar.name] = events
-        except Exception as e:
-            print(f"Could not fetch events for calendar {calendar.name}: {e}")
-            continue
-    save_cache(ICLOUD_EVENTS_CACHE, calendars_events)
+print("Fetching iCloud events.")
+calendars_events = {}
+now = datetime.now(pytz.timezone("UTC"))
+future_date = now + timedelta(days=DAYS_TO_SYNC)
+for calendar in calendars:
+    if calendar.name.startswith("Reminders"):
+        continue
+    if calendar.name in CALENDARS_TO_SKIP:
+        continue
+    try:
+        events = calendar.date_search(start=now, end=future_date)
+        print(f"Processing calendar {calendar.name}: Retrieved {len(events)} events.")
+        for event in events:
+            event.load()
+            props = event.get_properties([caldav.dav.GetEtag()])
+            event.etag = props.get("{DAV:}getetag", None)
+        calendars_events[calendar.name] = events
+    except Exception as e:
+        print(f"Could not fetch events for calendar {calendar.name}: {e}")
+        continue
 
-# Keep track of iCloud UIDs processed
 processed_icloud_uids = set()
 
-# Process all iCloud calendars and their events
 for calendar_name, events in calendars_events.items():
     print(f"Processing calendar: {calendar_name}")
-    # Process each iCloud event
     for event in events:
-        # Check if the event is an all-day event
         if is_all_day_event(event):
-            # It's an all-day event
             if calendar_name not in CALENDARS_ALLOW_FULL_DAY_EVENTS:
-                # Ignore the event
                 print(f"Ignoring all-day event in calendar {calendar_name}")
-                continue  # Skip to the next event
-        # Proceed with processing the event
+                continue
         icloud_uid = event.vobject_instance.vevent.uid.value
         icloud_etag = event.etag
         print(f"Processing iCloud event UID: {icloud_uid}")
         obfuscated_event = obfuscate_event(event)
         processed_icloud_uids.add(icloud_uid)
         if icloud_uid in google_event_map:
-            # Retrieve the stored ETag from Google Calendar event
             google_event = google_event_map[icloud_uid]
             google_etag = (
                 google_event.get("extendedProperties", {})
@@ -315,7 +253,6 @@ for calendar_name, events in calendars_events.items():
                 )
                 continue
 
-            # Update existing event in Google Calendar
             print(f"Updating event: {google_event['id']} with icloud_uid: {icloud_uid}")
             try:
                 updated_event = (
@@ -327,7 +264,6 @@ for calendar_name, events in calendars_events.items():
                     )
                     .execute()
                 )
-                # Update google_event_map with new extendedProperties
                 google_event_map[icloud_uid] = {
                     "id": updated_event["id"],
                     "extendedProperties": updated_event.get("extendedProperties"),
@@ -335,7 +271,6 @@ for calendar_name, events in calendars_events.items():
             except Exception as e:
                 print(f"Error updating event {google_event['id']}: {e}")
         else:
-            # Create new event in Google Calendar
             print(f"Creating new event with icloud_uid: {icloud_uid}")
             try:
                 created_event = (
@@ -343,7 +278,6 @@ for calendar_name, events in calendars_events.items():
                     .insert(calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event)
                     .execute()
                 )
-                # Add to google_event_map
                 google_event_map[icloud_uid] = {
                     "id": created_event["id"],
                     "extendedProperties": created_event.get("extendedProperties"),
@@ -351,7 +285,6 @@ for calendar_name, events in calendars_events.items():
             except Exception as e:
                 print(f"Error creating event with icloud_uid {icloud_uid}: {e}")
 
-# Delete events from Google Calendar that no longer exist in iCloud
 icloud_uids_in_google = set(google_event_map.keys())
 icloud_uids_not_in_icloud = icloud_uids_in_google - processed_icloud_uids
 
@@ -363,17 +296,12 @@ for icloud_uid in icloud_uids_not_in_icloud:
         service.events().delete(
             calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
         ).execute()
-        # Remove from google_event_map
         del google_event_map[icloud_uid]
     except Exception as e:
         print(f"Error deleting event {event_id}: {e}")
 
-# Save the updated Google event map
-save_cache(GOOGLE_EVENTS_CACHE, google_event_map)
-
 print("Synchronization complete.")
 
-end_time = time.time()  # Record the end time
-elapsed_time = end_time - start_time  # Calculate the elapsed time
-
+end_time = time.time()
+elapsed_time = end_time - start_time
 print(f"Script took {elapsed_time:.2f} seconds to run.")
