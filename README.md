@@ -5,6 +5,8 @@ Integrating your calendar with services like Calendly or Zoom requires granting 
 
 The script copies all events from your iCloud calendar from the present to a future date to your Google Calendar, deleting all events before the present. The script also obfuscates the event titles and descriptions.
 
+You can run the script manually or set up a cron job to run it automatically at a set interval.
+
 ### Google Calendar API Setup
 Create a Google Cloud Platform project and enable the Google Calendar API. Create a service account and download the JSON key file:
 - Open the (Google Cloud Console)[https://console.cloud.google.com/]:
