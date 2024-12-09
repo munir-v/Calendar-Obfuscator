@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta
-from pytz import timezone  # For handling time zones
+from datetime import datetime, timedelta, timezone
+import pytz  # For handling time zones
 import os
 import pickle
 import caldav
@@ -78,6 +78,32 @@ service = build("calendar", "v3", credentials=creds)
 
 # Define the Google Calendar ID (adjust as needed)
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
+# After building the Google Calendar service
+
+# Delete all events before the present
+now = datetime.now(timezone.utc).isoformat()
+page_token = None
+while True:
+    past_events = (
+        service.events()
+        .list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMax=now,
+            singleEvents=True,
+            orderBy="startTime",
+            pageToken=page_token,
+        )
+        .execute()
+    )
+
+    for event in past_events.get("items", []):
+        service.events().delete(
+            calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
+        ).execute()
+
+    page_token = past_events.get("nextPageToken")
+    if not page_token:
+        break
 
 
 # Function to convert iCloud recurrence rules to Google Calendar format
@@ -174,7 +200,9 @@ def is_all_day_event(event):
 def build_google_event_map():
     page_token = None
     google_events = {}
-    now = datetime.utcnow().isoformat() + "Z"  # 'Z' indicates UTC time
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()  # 'Z' indicates UTC time no longer needed
     while True:
         events_result = (
             service.events()
@@ -223,7 +251,8 @@ if icloud_events_cache is not None:
 else:
     print("Fetching iCloud events.")
     calendars_events = {}
-    now = datetime.now(timezone("UTC"))
+    # Use pytz.timezone to avoid overshadowing 'timezone'
+    now = datetime.now(pytz.timezone("UTC"))
     future_date = now + timedelta(days=DAYS_TO_SYNC)  # Adjust as needed
     for calendar in calendars:
         if calendar.name.startswith("Reminders"):
