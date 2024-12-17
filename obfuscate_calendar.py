@@ -36,18 +36,35 @@ def authenticate_google():
     creds = None
     # Load credentials from the token file if it exists
     if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "rb") as token:
-            creds = pickle.load(token)
+        try:
+            with open(TOKEN_FILE, "rb") as token:
+                creds = pickle.load(token)
+        except Exception as e:
+            print(f"Error loading token file: {e}. Deleting invalid token file.")
+            os.remove(TOKEN_FILE)
+            creds = None
+
     # If no valid credentials, authenticate and save them
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the credentials for the next run
-        with open(TOKEN_FILE, "wb") as token:
-            pickle.dump(creds, token)
+    try:
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                try:
+                    creds.refresh(Request())
+                except Exception as e:
+                    print(f"Error refreshing token: {e}. Deleting token file to reauthenticate.")
+                    os.remove(TOKEN_FILE)
+                    creds = None
+            if not creds:
+                print("Authenticating with Google OAuth2...")
+                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                creds = flow.run_local_server(port=0)
+                # Save the credentials for the next run
+                with open(TOKEN_FILE, "wb") as token:
+                    pickle.dump(creds, token)
+    except Exception as e:
+        print(f"Failed to authenticate with Google: {e}")
+        raise SystemExit("Exiting script due to authentication failure.")
+
     return creds
 
 
