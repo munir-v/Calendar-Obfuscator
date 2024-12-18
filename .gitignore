@@ -3,7 +3,6 @@ __pycache__/
 .vscode/
 .DS_Store
 constants.py
-*.txt
 credentials.json
 *.pickle
 *.log
