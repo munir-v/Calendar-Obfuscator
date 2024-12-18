@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-import pytz  
+import pytz
 import os
 import pickle
 import caldav
@@ -10,16 +10,16 @@ from google.auth.transport.requests import Request
 import time
 import logging
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
 CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.CALENDARS_ALLOW_FULL_DAY_EVENTS
 DAYS_TO_SYNC = 10
 
-# Suppress warnings from the vobject library
 logging.getLogger("root").setLevel(logging.ERROR)
 
 start_time = time.time()
 
-# Connect to iCloud via CalDAV
 client = caldav.DAVClient(
     url="https://caldav.icloud.com/",
     username=constants.ICLOUD_USERNAME,
@@ -28,13 +28,12 @@ client = caldav.DAVClient(
 principal = client.principal()
 calendars = principal.calendars()
 
-TOKEN_FILE = "token.pickle"
+TOKEN_FILE = os.path.join(BASE_DIR, "token.pickle")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 
 def authenticate_google():
     creds = None
-    # Load credentials from the token file if it exists
     if os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, "rb") as token:
@@ -44,7 +43,6 @@ def authenticate_google():
             os.remove(TOKEN_FILE)
             creds = None
 
-    # If no valid credentials, authenticate and save them
     try:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
@@ -56,9 +54,10 @@ def authenticate_google():
                     creds = None
             if not creds:
                 print("Authenticating with Google OAuth2...")
-                flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    os.path.join(BASE_DIR, "credentials.json"), SCOPES
+                )
                 creds = flow.run_local_server(port=0)
-                # Save the credentials for the next run
                 with open(TOKEN_FILE, "wb") as token:
                     pickle.dump(creds, token)
     except Exception as e:
@@ -68,14 +67,11 @@ def authenticate_google():
     return creds
 
 
-# Authenticate and build the Google Calendar service
 creds = authenticate_google()
 service = build("calendar", "v3", credentials=creds)
 
-# Define the Google Calendar ID (adjust as needed)
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
 
-# Delete all events before the present
 now = datetime.now(timezone.utc).isoformat()
 page_token = None
 while True:
@@ -101,21 +97,16 @@ while True:
         break
 
 
-# Function to convert iCloud recurrence rules to Google Calendar format
 def convert_recurrence(event):
     recurrence = []
     if hasattr(event, "rrule"):
-        # Access the recurrence rule directly
         rrule = event.rrule.value
-        # Convert the rule to a string format acceptable by Google Calendar
         recurrence.append(f"RRULE:{rrule}")
     return recurrence
 
 
-# Function to obfuscate event details and include iCloud ETag
 def obfuscate_event(event):
-    # Default to PST if no timezone is found
-    default_timezone = "America/Los_Angeles"  # PST timezone identifier
+    default_timezone = "America/Los_Angeles"
     start_dt = event.vobject_instance.vevent.dtstart.value
     end_dt = event.vobject_instance.vevent.dtend.value
 
@@ -137,14 +128,14 @@ def obfuscate_event(event):
         start_timezone = get_timezone_name(start_dt.tzinfo)
         start_time = start_dt.isoformat()
     else:
-        start_timezone = None  # No timezone for all-day events
+        start_timezone = None
         start_time = start_dt.isoformat()
 
     if isinstance(end_dt, datetime):
         end_timezone = get_timezone_name(end_dt.tzinfo)
         end_time = end_dt.isoformat()
     else:
-        end_timezone = None  # No timezone for all-day events
+        end_timezone = None
         end_time = end_dt.isoformat()
 
     event_body = {
@@ -180,13 +171,11 @@ def obfuscate_event(event):
     return event_body
 
 
-# Function to check if an event is an all-day event
 def is_all_day_event(event):
     start_dt = event.vobject_instance.vevent.dtstart.value
     return not isinstance(start_dt, datetime)
 
 
-# Build a map of iCloud UIDs to Google Event IDs, including extendedProperties
 def build_google_event_map():
     page_token = None
     google_events = {}
