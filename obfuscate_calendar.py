@@ -12,8 +12,8 @@ import logging
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-CALENDARS_TO_SKIP = constants.CALENDARS_TO_SKIP
-CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.CALENDARS_ALLOW_FULL_DAY_EVENTS
+ICLOUD_CALENDARS_TO_SKIP = constants.ICLOUD_CALENDARS_TO_SKIP
+ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS
 DAYS_TO_SYNC = 10
 
 logging.getLogger("root").setLevel(logging.ERROR)
@@ -217,7 +217,7 @@ future_date = now + timedelta(days=DAYS_TO_SYNC)
 for calendar in calendars:
     if calendar.name.startswith("Reminders"):
         continue
-    if calendar.name in CALENDARS_TO_SKIP:
+    if calendar.name in ICLOUD_CALENDARS_TO_SKIP:
         continue
     try:
         events = calendar.date_search(start=now, end=future_date)
@@ -237,7 +237,7 @@ for calendar_name, events in calendars_events.items():
     print(f"Processing calendar: {calendar_name}")
     for event in events:
         if is_all_day_event(event):
-            if calendar_name not in CALENDARS_ALLOW_FULL_DAY_EVENTS:
+            if calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
                 print(f"Ignoring all-day event in calendar {calendar_name}")
                 continue
         icloud_uid = event.vobject_instance.vevent.uid.value
