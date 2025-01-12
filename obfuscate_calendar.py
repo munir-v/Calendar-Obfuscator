@@ -5,7 +5,7 @@ import pickle
 import caldav
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import constants  # Contains ICLOUD_USERNAME, ICLOUD_PASSWORD, and GOOGLE_CALENDAR_ID
+import constants 
 from google.auth.transport.requests import Request
 import time
 import logging
@@ -14,6 +14,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ICLOUD_CALENDARS_TO_SKIP = constants.ICLOUD_CALENDARS_TO_SKIP
 ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS
+GOOGLE_CALENDARS_TO_SKIP_DELETION = constants.GOOGLE_CALENDARS_TO_SKIP_DELETION
+
 DAYS_TO_SYNC = 10
 
 logging.getLogger("root").setLevel(logging.ERROR)
@@ -72,29 +74,33 @@ service = build("calendar", "v3", credentials=creds)
 
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
 
-now = datetime.now(timezone.utc).isoformat()
-page_token = None
-while True:
-    past_events = (
-        service.events()
-        .list(
-            calendarId=GOOGLE_CALENDAR_ID,
-            timeMax=now,
-            singleEvents=True,
-            orderBy="startTime",
-            pageToken=page_token,
+if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
+    now = datetime.now(timezone.utc).isoformat()
+    page_token = None
+    while True:
+        past_events = (
+            service.events()
+            .list(
+                calendarId=GOOGLE_CALENDAR_ID,
+                timeMax=now,
+                singleEvents=True,
+                orderBy="startTime",
+                pageToken=page_token,
+            )
+            .execute()
         )
-        .execute()
-    )
 
-    for event in past_events.get("items", []):
-        service.events().delete(
-            calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
-        ).execute()
+        for event in past_events.get("items", []):
+            service.events().delete(
+                calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
+            ).execute()
 
-    page_token = past_events.get("nextPageToken")
-    if not page_token:
-        break
+        page_token = past_events.get("nextPageToken")
+        if not page_token:
+            break
+else:
+    print(f"Skipping deletion of past events for {GOOGLE_CALENDAR_ID} "
+          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
 
 
 def convert_recurrence(event):
@@ -218,6 +224,7 @@ for calendar in calendars:
     if calendar.name.startswith("Reminders"):
         continue
     if calendar.name in ICLOUD_CALENDARS_TO_SKIP:
+        print(f"Skipping iCloud calendar: {calendar.name}")
         continue
     try:
         events = calendar.date_search(start=now, end=future_date)
@@ -294,17 +301,21 @@ for calendar_name, events in calendars_events.items():
 icloud_uids_in_google = set(google_event_map.keys())
 icloud_uids_not_in_icloud = icloud_uids_in_google - processed_icloud_uids
 
-for icloud_uid in icloud_uids_not_in_icloud:
-    event_info = google_event_map[icloud_uid]
-    event_id = event_info["id"]
-    print(f"Deleting event with icloud_uid: {icloud_uid}")
-    try:
-        service.events().delete(
-            calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
-        ).execute()
-        del google_event_map[icloud_uid]
-    except Exception as e:
-        print(f"Error deleting event {event_id}: {e}")
+if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
+    for icloud_uid in icloud_uids_not_in_icloud:
+        event_info = google_event_map[icloud_uid]
+        event_id = event_info["id"]
+        print(f"Deleting event with icloud_uid: {icloud_uid}")
+        try:
+            service.events().delete(
+                calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
+            ).execute()
+            del google_event_map[icloud_uid]
+        except Exception as e:
+            print(f"Error deleting event {event_id}: {e}")
+else:
+    print(f"Skipping deletion of orphan events for {GOOGLE_CALENDAR_ID} "
+          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
 
 print("Synchronization complete.")
 
