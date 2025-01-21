@@ -5,7 +5,7 @@ import pickle
 import caldav
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-import constants 
+import constants
 from google.auth.transport.requests import Request
 import time
 import logging
@@ -91,6 +91,9 @@ if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
         )
 
         for event in past_events.get("items", []):
+            if event.get("eventType") == "birthday":
+                continue
+
             service.events().delete(
                 calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
             ).execute()
@@ -199,6 +202,9 @@ def build_google_event_map():
             .execute()
         )
         for event in events_result.get("items", []):
+            if event.get("eventType") == "birthday":
+                continue
+
             icloud_uid = (
                 event.get("extendedProperties", {}).get("private", {}).get("icloud_uid")
             )
