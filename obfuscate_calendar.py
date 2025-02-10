@@ -16,7 +16,7 @@ ICLOUD_CALENDARS_TO_SKIP = constants.ICLOUD_CALENDARS_TO_SKIP
 ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS
 GOOGLE_CALENDARS_TO_SKIP_DELETION = constants.GOOGLE_CALENDARS_TO_SKIP_DELETION
 
-DAYS_TO_SYNC = 10
+DAYS_TO_SYNC = 31
 
 logging.getLogger("root").setLevel(logging.ERROR)
 
@@ -74,36 +74,29 @@ service = build("calendar", "v3", credentials=creds)
 
 GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
 
+# 1) Delete ALL events from the Google Calendar unless it's in the skip list.
 if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
-    now = datetime.now(timezone.utc).isoformat()
+    print("Deleting all existing events from Google Calendar...")
     page_token = None
     while True:
-        past_events = (
-            service.events()
-            .list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMax=now,
-                singleEvents=True,
-                orderBy="startTime",
-                pageToken=page_token,
-            )
-            .execute()
-        )
-
-        for event in past_events.get("items", []):
+        events_result = service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            pageToken=page_token,
+            maxResults=2500
+        ).execute()
+        events = events_result.get("items", [])
+        for event in events:
             if event.get("eventType") == "birthday":
                 continue
-
             service.events().delete(
                 calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
             ).execute()
-
-        page_token = past_events.get("nextPageToken")
+        page_token = events_result.get("nextPageToken")
         if not page_token:
             break
+    print("All existing events deleted.")
 else:
-    print(f"Skipping deletion of past events for {GOOGLE_CALENDAR_ID} "
-          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
+    print(f"Skipping deletion for {GOOGLE_CALENDAR_ID} (in skip-deletion list).")
 
 
 def convert_recurrence(event):
@@ -137,6 +130,7 @@ def obfuscate_event(event):
         start_timezone = get_timezone_name(start_dt.tzinfo)
         start_time = start_dt.isoformat()
     else:
+        # All-day (date only)
         start_timezone = None
         start_time = start_dt.isoformat()
 
@@ -144,6 +138,7 @@ def obfuscate_event(event):
         end_timezone = get_timezone_name(end_dt.tzinfo)
         end_time = end_dt.isoformat()
     else:
+        # All-day (date only)
         end_timezone = None
         end_time = end_dt.isoformat()
 
@@ -185,47 +180,11 @@ def is_all_day_event(event):
     return not isinstance(start_dt, datetime)
 
 
-def build_google_event_map():
-    page_token = None
-    google_events = {}
-    now = datetime.now(timezone.utc).isoformat()
-    while True:
-        events_result = (
-            service.events()
-            .list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                pageToken=page_token,
-                singleEvents=False,
-                maxResults=2500,
-                timeMin=now,
-            )
-            .execute()
-        )
-        for event in events_result.get("items", []):
-            if event.get("eventType") == "birthday":
-                continue
-
-            icloud_uid = (
-                event.get("extendedProperties", {}).get("private", {}).get("icloud_uid")
-            )
-            if icloud_uid:
-                google_events[icloud_uid] = {
-                    "id": event["id"],
-                    "extendedProperties": event.get("extendedProperties"),
-                }
-        page_token = events_result.get("nextPageToken")
-        if not page_token:
-            break
-    return google_events
-
-
-print("Fetching Google events.")
-google_event_map = build_google_event_map()
-
 print("Fetching iCloud events.")
 calendars_events = {}
-now = datetime.now(pytz.timezone("UTC"))
-future_date = now + timedelta(days=DAYS_TO_SYNC)
+now_utc = datetime.now(pytz.timezone("UTC"))
+future_date = now_utc + timedelta(days=DAYS_TO_SYNC)
+
 for calendar in calendars:
     if calendar.name.startswith("Reminders"):
         continue
@@ -233,7 +192,8 @@ for calendar in calendars:
         print(f"Skipping iCloud calendar: {calendar.name}")
         continue
     try:
-        events = calendar.date_search(start=now, end=future_date)
+        # Fetch events from iCloud
+        events = calendar.date_search(start=now_utc, end=future_date)
         print(f"Processing calendar {calendar.name}: Retrieved {len(events)} events.")
         for event in events:
             event.load()
@@ -244,84 +204,21 @@ for calendar in calendars:
         print(f"Could not fetch events for calendar {calendar.name}: {e}")
         continue
 
-processed_icloud_uids = set()
-
+print("Adding iCloud events to Google Calendar...")
 for calendar_name, events in calendars_events.items():
     print(f"Processing calendar: {calendar_name}")
     for event in events:
-        if is_all_day_event(event):
-            if calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
-                print(f"Ignoring all-day event in calendar {calendar_name}")
-                continue
-        icloud_uid = event.vobject_instance.vevent.uid.value
-        icloud_etag = event.etag
-        print(f"Processing iCloud event UID: {icloud_uid}")
+        if is_all_day_event(event) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
+            print(f"Ignoring all-day event in calendar {calendar_name}")
+            continue
         obfuscated_event = obfuscate_event(event)
-        processed_icloud_uids.add(icloud_uid)
-        if icloud_uid in google_event_map:
-            google_event = google_event_map[icloud_uid]
-            google_etag = (
-                google_event.get("extendedProperties", {})
-                .get("private", {})
-                .get("icloud_etag")
-            )
-
-            if icloud_etag == google_etag:
-                print(
-                    f"No changes detected for event {google_event['id']}; skipping update."
-                )
-                continue
-
-            print(f"Updating event: {google_event['id']} with icloud_uid: {icloud_uid}")
-            try:
-                updated_event = (
-                    service.events()
-                    .update(
-                        calendarId=GOOGLE_CALENDAR_ID,
-                        eventId=google_event["id"],
-                        body=obfuscated_event,
-                    )
-                    .execute()
-                )
-                google_event_map[icloud_uid] = {
-                    "id": updated_event["id"],
-                    "extendedProperties": updated_event.get("extendedProperties"),
-                }
-            except Exception as e:
-                print(f"Error updating event {google_event['id']}: {e}")
-        else:
-            print(f"Creating new event with icloud_uid: {icloud_uid}")
-            try:
-                created_event = (
-                    service.events()
-                    .insert(calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event)
-                    .execute()
-                )
-                google_event_map[icloud_uid] = {
-                    "id": created_event["id"],
-                    "extendedProperties": created_event.get("extendedProperties"),
-                }
-            except Exception as e:
-                print(f"Error creating event with icloud_uid {icloud_uid}: {e}")
-
-icloud_uids_in_google = set(google_event_map.keys())
-icloud_uids_not_in_icloud = icloud_uids_in_google - processed_icloud_uids
-
-if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
-    for icloud_uid in icloud_uids_not_in_icloud:
-        event_info = google_event_map[icloud_uid]
-        event_id = event_info["id"]
-        print(f"Deleting event with icloud_uid: {icloud_uid}")
         try:
-            service.events().delete(
-                calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
+            service.events().insert(
+                calendarId=GOOGLE_CALENDAR_ID,
+                body=obfuscated_event
             ).execute()
-            del google_event_map[icloud_uid]
         except Exception as e:
-            print(f"Error deleting event {event_id}: {e}")
-else:
-    print(f"Skipping deletion of orphan events for {GOOGLE_CALENDAR_ID} "
-          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
+            print(f"Error creating event with UID {event.vobject_instance.vevent.uid.value}: {e}")
 
 print("Synchronization complete.")
 
