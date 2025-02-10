@@ -1,40 +1,61 @@
-from datetime import datetime, timedelta, timezone
-import pytz
+"""
+This script synchronizes iCloud calendar events to a Google Calendar, obfuscating
+all event details in the process (replacing titles with "Busy"). It can optionally
+delete existing events from the target Google Calendar (unless the calendar is in
+the skip-deletion list) before creating new ones.
+
+Steps performed by this script:
+1. Authenticate with Google OAuth 2.0 and build the Google Calendar service.
+2. Optionally delete all events from the target Google Calendar unless it’s in the skip list.
+3. Fetch events from iCloud calendars, skipping certain calendars and ignoring all-day events
+   if configured.
+4. Create obfuscated events in the Google Calendar with minimal event details.
+"""
+
 import os
 import pickle
-import caldav
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-import constants
-from google.auth.transport.requests import Request
 import time
 import logging
+from datetime import datetime, timedelta
+import pytz
+import caldav
 
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from google.auth.transport.requests import Request
+
+import constants
+
+logging.getLogger("root").setLevel(logging.ERROR)
+
+# --- Global Constants and Configuration ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 ICLOUD_CALENDARS_TO_SKIP = constants.ICLOUD_CALENDARS_TO_SKIP
 ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS = constants.ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS
 GOOGLE_CALENDARS_TO_SKIP_DELETION = constants.GOOGLE_CALENDARS_TO_SKIP_DELETION
+GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
 
 DAYS_TO_SYNC = 31
-
-logging.getLogger("root").setLevel(logging.ERROR)
-
-start_time = time.time()
-
-client = caldav.DAVClient(
-    url="https://caldav.icloud.com/",
-    username=constants.ICLOUD_USERNAME,
-    password=constants.ICLOUD_PASSWORD,
-)
-principal = client.principal()
-calendars = principal.calendars()
 
 TOKEN_FILE = os.path.join(BASE_DIR, "token.pickle")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+ICLOUD_CLIENT = caldav.DAVClient(
+    url="https://caldav.icloud.com/",
+    username=constants.ICLOUD_USERNAME,
+    password=constants.ICLOUD_PASSWORD,
+)
+
 
 def authenticate_google():
+    """
+    Authenticate with Google OAuth2 and return the credentials object.
+
+    If valid credentials exist in the token file, use them. Otherwise, prompt the user
+    to log in through OAuth. On success, save the credentials to the token file.
+    """
     creds = None
     if os.path.exists(TOKEN_FILE):
         try:
@@ -48,18 +69,23 @@ def authenticate_google():
     try:
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
+                # Try to refresh existing credentials
                 try:
                     creds.refresh(Request())
                 except Exception as e:
-                    print(f"Error refreshing token: {e}. Deleting token file to reauthenticate.")
+                    print(f"Error refreshing token: {e}. Re-authentication required.")
                     os.remove(TOKEN_FILE)
                     creds = None
+
             if not creds:
+                # No valid credentials, prompt user
                 print("Authenticating with Google OAuth2...")
                 flow = InstalledAppFlow.from_client_secrets_file(
                     os.path.join(BASE_DIR, "credentials.json"), SCOPES
                 )
                 creds = flow.run_local_server(port=0)
+
+                # Save the credentials for next time
                 with open(TOKEN_FILE, "wb") as token:
                     pickle.dump(creds, token)
     except Exception as e:
@@ -69,61 +95,76 @@ def authenticate_google():
     return creds
 
 
-creds = authenticate_google()
-service = build("calendar", "v3", credentials=creds)
+def delete_all_events_from_google(service, google_calendar_id):
+    """
+    Delete all existing events from a specified Google Calendar.
 
-GOOGLE_CALENDAR_ID = constants.GOOGLE_CALENDAR_ID
-
-#
-# 1) Delete all past events from the Google Calendar (unless it's in SKIP_DELETION).
-#
-if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
-    now = datetime.now(timezone.utc).isoformat()
+    :param service: Authenticated Google Calendar API service object.
+    :param google_calendar_id: The ID of the Google Calendar to clear.
+    """
+    print("Deleting all existing events from Google Calendar...")
     page_token = None
     while True:
-        past_events = (
-            service.events()
-            .list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMax=now,
-                singleEvents=True,     # to catch each instance that ended in the past
-                orderBy="startTime",
-                pageToken=page_token,
-            )
-            .execute()
-        )
+        events_result = service.events().list(
+            calendarId=google_calendar_id,
+            pageToken=page_token,
+            maxResults=2500
+        ).execute()
+        events = events_result.get("items", [])
 
-        for event in past_events.get("items", []):
-            # For example, skip 'birthday' type events
+        for event in events:
+            # Skip birthday or read-only events
             if event.get("eventType") == "birthday":
                 continue
+            try:
+                service.events().delete(
+                    calendarId=google_calendar_id,
+                    eventId=event["id"]
+                ).execute()
+            except HttpError as e:
+                # Error 410 means it's already gone
+                if e.resp.status == 410:
+                    print(f"Event {event['id']} is already deleted, skipping.")
+                else:
+                    raise
 
-            service.events().delete(
-                calendarId=GOOGLE_CALENDAR_ID, eventId=event["id"]
-            ).execute()
-
-        page_token = past_events.get("nextPageToken")
+        page_token = events_result.get("nextPageToken")
         if not page_token:
             break
-else:
-    print(f"Skipping deletion of past events for {GOOGLE_CALENDAR_ID} "
-          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
+
+    print("All existing events deleted.")
 
 
-def convert_recurrence(event):
+def convert_recurrence(vevent):
+    """
+    Convert an iCloud event's recurrence rule to a Google API-compatible recurrence list.
+
+    :param vevent: A vobject VEVENT instance (part of the loaded caldav Event).
+    :return: List containing a single RRULE string if present, otherwise empty list.
+    """
     recurrence = []
-    if hasattr(event, "rrule"):
-        rrule = event.rrule.value
+    if hasattr(vevent, "rrule"):
+        rrule = vevent.rrule.value
         recurrence.append(f"RRULE:{rrule}")
     return recurrence
 
 
 def obfuscate_event(event):
+    """
+    Create an obfuscated event body suitable for Google Calendar insertion.
+
+    :param event: A caldav Event object with vobject instance data.
+    :return: Dictionary representing the event body for the Google Calendar API.
+    """
     default_timezone = "America/Los_Angeles"
     start_dt = event.vobject_instance.vevent.dtstart.value
     end_dt = event.vobject_instance.vevent.dtend.value
 
     def get_timezone_name(tzinfo):
+        """
+        Extract a time zone name from the provided tzinfo. Falls back to default_timezone
+        if none can be determined.
+        """
         if tzinfo:
             try:
                 if hasattr(tzinfo, "zone"):
@@ -139,37 +180,37 @@ def obfuscate_event(event):
 
     if isinstance(start_dt, datetime):
         start_timezone = get_timezone_name(start_dt.tzinfo)
-        start_time = start_dt.isoformat()
+        start_time_iso = start_dt.isoformat()
     else:
         # All-day (date only)
         start_timezone = None
-        start_time = start_dt.isoformat()
+        start_time_iso = start_dt.isoformat()
 
     if isinstance(end_dt, datetime):
         end_timezone = get_timezone_name(end_dt.tzinfo)
-        end_time = end_dt.isoformat()
+        end_time_iso = end_dt.isoformat()
     else:
         # All-day (date only)
         end_timezone = None
-        end_time = end_dt.isoformat()
+        end_time_iso = end_dt.isoformat()
 
     event_body = {
         "summary": "Busy",
         "start": (
             {
-                "dateTime": start_time,
+                "dateTime": start_time_iso,
                 "timeZone": start_timezone if start_timezone else default_timezone,
             }
             if start_timezone
-            else {"date": start_time}
+            else {"date": start_time_iso}
         ),
         "end": (
             {
-                "dateTime": end_time,
+                "dateTime": end_time_iso,
                 "timeZone": end_timezone if end_timezone else default_timezone,
             }
             if end_timezone
-            else {"date": end_time}
+            else {"date": end_time_iso}
         ),
         "transparency": "opaque",
         "extendedProperties": {
@@ -180,6 +221,7 @@ def obfuscate_event(event):
         },
     }
 
+    # Handle recurrence
     if hasattr(event.vobject_instance.vevent, "rrule"):
         event_body["recurrence"] = convert_recurrence(event.vobject_instance.vevent)
 
@@ -187,176 +229,110 @@ def obfuscate_event(event):
 
 
 def is_all_day_event(event):
+    """
+    Determine if the iCloud event is an all-day event.
+
+    :param event: A caldav Event object with vobject instance data.
+    :return: True if the event has a date-only start time, otherwise False.
+    """
     start_dt = event.vobject_instance.vevent.dtstart.value
     return not isinstance(start_dt, datetime)
 
 
-#
-# 2) Build a map of Google events for the relevant calendar
-#    so we know which ones already exist (based on iCloud UID).
-#
-def build_google_event_map():
-    page_token = None
-    google_events = {}
+def fetch_icloud_events():
+    """
+    Fetch events from iCloud calendars (skipping those in the skip list), within the next
+    DAYS_TO_SYNC days. Event objects have their etag loaded for use in extended properties
+    when creating Google events.
 
-    #
-    # IMPORTANT FIX: Remove timeMin=now so that we can detect
-    # recurring events whose "start" was in the past but which
-    # still have future recurrences.
-    #
-    while True:
-        events_result = (
-            service.events()
-            .list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                pageToken=page_token,
-                singleEvents=False,  # or True if you want every instance
-                maxResults=2500
-                # timeMin=now <-- REMOVED to ensure we don't skip older recurring events
-            )
-            .execute()
-        )
-        for event in events_result.get("items", []):
-            # skip 'birthday' type events
-            if event.get("eventType") == "birthday":
-                continue
+    :return: Dictionary mapping calendar names to lists of caldav Event objects.
+    """
+    calendars_events = {}
+    principal = ICLOUD_CLIENT.principal()
+    calendars = principal.calendars()
 
-            icloud_uid = (
-                event.get("extendedProperties", {})
-                .get("private", {})
-                .get("icloud_uid")
-            )
-            if icloud_uid:
-                google_events[icloud_uid] = {
-                    "id": event["id"],
-                    "extendedProperties": event.get("extendedProperties"),
-                }
-        page_token = events_result.get("nextPageToken")
-        if not page_token:
-            break
-    return google_events
+    now_utc = datetime.now(pytz.timezone("UTC"))
+    future_date = now_utc + timedelta(days=DAYS_TO_SYNC)
 
-
-print("Fetching Google events.")
-google_event_map = build_google_event_map()
-
-print("Fetching iCloud events.")
-calendars_events = {}
-now_utc = datetime.now(pytz.timezone("UTC"))
-future_date = now_utc + timedelta(days=DAYS_TO_SYNC)
-
-for calendar in calendars:
-    if calendar.name.startswith("Reminders"):
-        continue
-    if calendar.name in ICLOUD_CALENDARS_TO_SKIP:
-        print(f"Skipping iCloud calendar: {calendar.name}")
-        continue
-    try:
-        # If you're missing recurring events that start in the past but have future instances,
-        # you may need to move `start=now_utc - some_timedelta` or pass `expand=True`.
-        events = calendar.date_search(start=now_utc, end=future_date)
-        print(f"Processing calendar {calendar.name}: Retrieved {len(events)} events.")
-        for event in events:
-            event.load()
-            props = event.get_properties([caldav.dav.GetEtag()])
-            event.etag = props.get("{DAV:}getetag", None)
-        calendars_events[calendar.name] = events
-    except Exception as e:
-        print(f"Could not fetch events for calendar {calendar.name}: {e}")
-        continue
-
-processed_icloud_uids = set()
-
-#
-# 3) Go through all iCloud events and either create or update them in Google.
-#
-for calendar_name, events in calendars_events.items():
-    print(f"Processing calendar: {calendar_name}")
-    for event in events:
-        # Skip all-day events unless this calendar is explicitly allowed
-        if is_all_day_event(event) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
-            print(f"Ignoring all-day event in calendar {calendar_name}")
+    print("Fetching iCloud events.")
+    for calendar in calendars:
+        # Skip reminders and calendars in the skip list
+        if calendar.name.startswith("Reminders"):
+            continue
+        if calendar.name in ICLOUD_CALENDARS_TO_SKIP:
+            print(f"Skipping iCloud calendar: {calendar.name}")
             continue
 
-        icloud_uid = event.vobject_instance.vevent.uid.value
-        icloud_etag = event.etag
-        print(f"Processing iCloud event UID: {icloud_uid}")
+        try:
+            events = calendar.date_search(start=now_utc, end=future_date)
+            print(f"Processing calendar {calendar.name}: Retrieved {len(events)} events.")
+            for event in events:
+                event.load()
+                props = event.get_properties([caldav.dav.GetEtag()])
+                event.etag = props.get("{DAV:}getetag", None)
+            calendars_events[calendar.name] = events
+        except Exception as e:
+            print(f"Could not fetch events for calendar {calendar.name}: {e}")
+            continue
 
-        obfuscated_event = obfuscate_event(event)
-        processed_icloud_uids.add(icloud_uid)
+    return calendars_events
 
-        if icloud_uid in google_event_map:
-            google_event = google_event_map[icloud_uid]
-            google_etag = (
-                google_event.get("extendedProperties", {})
-                .get("private", {})
-                .get("icloud_etag")
-            )
 
-            # If iCloud and Google ETag match, skip
-            if icloud_etag == google_etag:
-                print(
-                    f"No changes detected for event {google_event['id']}; skipping update."
-                )
+def add_icloud_events_to_google(service, calendars_events):
+    """
+    Insert obfuscated iCloud events into the Google Calendar.
+
+    :param service: Authenticated Google Calendar API service object.
+    :param calendars_events: Dictionary of {calendar_name: [caldav Event, ...]}.
+    """
+    print("Adding iCloud events to Google Calendar...")
+    for calendar_name, events in calendars_events.items():
+        print(f"Processing calendar: {calendar_name}")
+        for event in events:
+            # Skip all-day events if the calendar is not allowed to have them
+            if is_all_day_event(event) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
+                print(f"Ignoring all-day event in calendar {calendar_name}")
                 continue
 
-            print(f"Updating event: {google_event['id']} with icloud_uid: {icloud_uid}")
+            obfuscated_event = obfuscate_event(event)
             try:
-                updated_event = (
-                    service.events()
-                    .update(
-                        calendarId=GOOGLE_CALENDAR_ID,
-                        eventId=google_event["id"],
-                        body=obfuscated_event,
-                    )
-                    .execute()
-                )
-                google_event_map[icloud_uid] = {
-                    "id": updated_event["id"],
-                    "extendedProperties": updated_event.get("extendedProperties"),
-                }
+                service.events().insert(
+                    calendarId=GOOGLE_CALENDAR_ID,
+                    body=obfuscated_event
+                ).execute()
             except Exception as e:
-                print(f"Error updating event {google_event['id']}: {e}")
-        else:
-            # Create a brand new event in Google
-            print(f"Creating new event with icloud_uid: {icloud_uid}")
-            try:
-                created_event = (
-                    service.events()
-                    .insert(calendarId=GOOGLE_CALENDAR_ID, body=obfuscated_event)
-                    .execute()
-                )
-                google_event_map[icloud_uid] = {
-                    "id": created_event["id"],
-                    "extendedProperties": created_event.get("extendedProperties"),
-                }
-            except Exception as e:
-                print(f"Error creating event with icloud_uid {icloud_uid}: {e}")
+                uid = event.vobject_instance.vevent.uid.value
+                print(f"Error creating event with UID {uid}: {e}")
 
-#
-# 4) Delete any events in Google that are no longer in iCloud (i.e., "orphan" events).
-#
-icloud_uids_in_google = set(google_event_map.keys())
-icloud_uids_not_in_icloud = icloud_uids_in_google - processed_icloud_uids
 
-if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
-    for icloud_uid in icloud_uids_not_in_icloud:
-        event_info = google_event_map[icloud_uid]
-        event_id = event_info["id"]
-        print(f"Deleting orphan event with icloud_uid: {icloud_uid}")
-        try:
-            service.events().delete(
-                calendarId=GOOGLE_CALENDAR_ID, eventId=event_id
-            ).execute()
-            del google_event_map[icloud_uid]
-        except Exception as e:
-            print(f"Error deleting event {event_id}: {e}")
-else:
-    print(f"Skipping deletion of orphan events for {GOOGLE_CALENDAR_ID} "
-          f"because it is in GOOGLE_CALENDARS_TO_SKIP_DELETION.")
+def main():
+    """
+    Main script entry point. Authenticates with Google, deletes existing events (if allowed),
+    fetches iCloud events, and adds them to the Google Calendar with obfuscation.
+    """
+    start_time = time.time()
 
-print("Synchronization complete.")
+    # Authenticate with Google
+    creds = authenticate_google()
+    service = build("calendar", "v3", credentials=creds)
 
-end_time = time.time()
-elapsed_time = end_time - start_time
-print(f"Script took {elapsed_time:.2f} seconds to run.")
+    # 1) Optionally delete all events from the Google Calendar
+    if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
+        delete_all_events_from_google(service, GOOGLE_CALENDAR_ID)
+    else:
+        print(f"Skipping deletion for {GOOGLE_CALENDAR_ID} (in skip-deletion list).")
+
+    # 2) Fetch iCloud events
+    calendars_events = fetch_icloud_events()
+
+    # 3) Add iCloud events to Google Calendar
+    add_icloud_events_to_google(service, calendars_events)
+
+    # Wrap up timing
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Script took {elapsed_time:.2f} seconds to run.")
+
+
+if __name__ == "__main__":
+    main()
