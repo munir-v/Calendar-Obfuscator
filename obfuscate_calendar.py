@@ -1,17 +1,3 @@
-"""
-This script synchronizes iCloud calendar events to a Google Calendar, obfuscating
-all event details in the process (replacing titles with "Busy"). It can optionally
-delete existing events from the target Google Calendar (unless the calendar is in
-the skip-deletion list) before creating new ones.
-
-Steps performed by this script:
-1. Authenticate with Google OAuth 2.0 and build the Google Calendar service.
-2. Optionally delete all events from the target Google Calendar unless it’s in the skip list.
-3. Fetch events from iCloud calendars, skipping certain calendars and ignoring all-day events
-   if configured.
-4. Create obfuscated events in the Google Calendar with minimal event details.
-"""
-
 import os
 import pickle
 import time
@@ -137,16 +123,60 @@ def delete_all_events_from_google(service, google_calendar_id):
 
 def convert_recurrence(vevent):
     """
-    Convert an iCloud event's recurrence rule to a Google API-compatible recurrence list.
-
-    :param vevent: A vobject VEVENT instance (part of the loaded caldav Event).
-    :return: List containing a single RRULE string if present, otherwise empty list.
+    Convert an iCloud event's recurrence (RRULE and EXDATE) to a
+    Google API-compatible recurrence list.
     """
     recurrence = []
+
+    # 1. Handle the main recurrence rule (RRULE)
     if hasattr(vevent, "rrule"):
         rrule = vevent.rrule.value
         recurrence.append(f"RRULE:{rrule}")
+
+    # 2. Handle EXDATE
+    if hasattr(vevent, "exdate"):
+        exdates = vevent.exdate
+        if not isinstance(exdates, list):
+            exdates = [exdates]  # put it in a list for uniform handling
+
+        for exd in exdates:
+            if isinstance(exd.value, list):
+                for dt in exd.value:
+                    exdate_str = _format_exdate(dt, exd.params)
+                    recurrence.append(exdate_str)
+            else:
+                dt = exd.value
+                exdate_str = _format_exdate(dt, exd.params)
+                recurrence.append(exdate_str)
+
     return recurrence
+
+
+def _format_exdate(dt, exdate_params):
+    """
+    Format the EXDATE for Google. 
+    exdate_params can contain a TZID, etc. 
+    For all-day vs. date-time events, you'll need to handle carefully.
+    """
+    # If it's a date (no time), format as EXDATE;VALUE=DATE:YYYYMMDD
+    # If it's a datetime, format as EXDATE;VALUE=DATE-TIME:YYYYMMDDTHHMMSSZ, with or without TZID
+    # You can rely on iCal's default formatting or manually build them.
+
+    # Example minimal approach (you may want to refine):
+    if isinstance(dt, datetime):
+        # If there's a timezone in exdate_params, include it
+        tzid = exdate_params.get('TZID')
+        # If tzid is present, you'll do something like:
+        # "EXDATE;TZID=America/Los_Angeles:20230616T090000"
+        if tzid:
+            return f"EXDATE;TZID={tzid}:{dt.strftime('%Y%m%dT%H%M%S')}"
+        else:
+            # Use UTC (Z) if it’s UTC or naive
+            # dt.isoformat() might produce microseconds, so strip them
+            return f"EXDATE:{dt.strftime('%Y%m%dT%H%M%SZ')}"
+    else:
+        # it's a date
+        return f"EXDATE;VALUE=DATE:{dt.strftime('%Y%m%d')}"
 
 
 def obfuscate_event(event):
