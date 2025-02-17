@@ -121,10 +121,10 @@ def delete_all_events_from_google(service, google_calendar_id):
     print("All existing events deleted.")
 
 
-def convert_recurrence(vevent):
+def convert_master_recurrence(vevent):
     """
-    Convert an iCloud event's recurrence (RRULE and EXDATE) to a
-    Google API-compatible recurrence list.
+    Convert a master (non-override) iCloud VEVENT's recurrence (RRULE & EXDATE) 
+    to a Google API-compatible recurrence list.
     """
     recurrence = []
 
@@ -133,7 +133,7 @@ def convert_recurrence(vevent):
         rrule = vevent.rrule.value
         recurrence.append(f"RRULE:{rrule}")
 
-    # 2. Handle EXDATE
+    # 2. Handle EXDATE (if any on the master)
     if hasattr(vevent, "exdate"):
         exdates = vevent.exdate
         if not isinstance(exdates, list):
@@ -154,41 +154,37 @@ def convert_recurrence(vevent):
 
 def _format_exdate(dt, exdate_params):
     """
-    Format the EXDATE for Google. 
-    exdate_params can contain a TZID, etc. 
+    Format the EXDATE for Google.
+    exdate_params can contain a TZID, etc.
     For all-day vs. date-time events, you'll need to handle carefully.
     """
-    # If it's a date (no time), format as EXDATE;VALUE=DATE:YYYYMMDD
-    # If it's a datetime, format as EXDATE;VALUE=DATE-TIME:YYYYMMDDTHHMMSSZ, with or without TZID
-    # You can rely on iCal's default formatting or manually build them.
-
-    # Example minimal approach (you may want to refine):
     if isinstance(dt, datetime):
-        # If there's a timezone in exdate_params, include it
         tzid = exdate_params.get('TZID')
-        # If tzid is present, you'll do something like:
-        # "EXDATE;TZID=America/Los_Angeles:20230616T090000"
         if tzid:
+            # e.g. EXDATE;TZID=America/Los_Angeles:20250124T143000
             return f"EXDATE;TZID={tzid}:{dt.strftime('%Y%m%dT%H%M%S')}"
         else:
             # Use UTC (Z) if it’s UTC or naive
-            # dt.isoformat() might produce microseconds, so strip them
             return f"EXDATE:{dt.strftime('%Y%m%dT%H%M%SZ')}"
     else:
-        # it's a date
+        # It's a date
         return f"EXDATE;VALUE=DATE:{dt.strftime('%Y%m%d')}"
 
 
-def obfuscate_event(event):
+def obfuscate_vevent(vevent, etag):
     """
-    Create an obfuscated event body suitable for Google Calendar insertion.
-
-    :param event: A caldav Event object with vobject instance data.
-    :return: Dictionary representing the event body for the Google Calendar API.
+    Create an obfuscated event body from a single VEVENT (master or override).
     """
     default_timezone = "America/Los_Angeles"
-    start_dt = event.vobject_instance.vevent.dtstart.value
-    end_dt = event.vobject_instance.vevent.dtend.value
+    start_dt = vevent.dtstart.value
+    end_dt = vevent.dtend.value if hasattr(vevent, "dtend") else None
+
+    # Safeguard if dtend is missing, just add 1 hour
+    if not end_dt:
+        if isinstance(start_dt, datetime):
+            end_dt = start_dt + timedelta(hours=1)
+        else:
+            end_dt = start_dt
 
     def get_timezone_name(tzinfo):
         """
@@ -208,11 +204,11 @@ def obfuscate_event(event):
                 pass
         return default_timezone
 
+    # Distinguish between datetime vs. date (all-day)
     if isinstance(start_dt, datetime):
         start_timezone = get_timezone_name(start_dt.tzinfo)
         start_time_iso = start_dt.isoformat()
     else:
-        # All-day (date only)
         start_timezone = None
         start_time_iso = start_dt.isoformat()
 
@@ -220,16 +216,15 @@ def obfuscate_event(event):
         end_timezone = get_timezone_name(end_dt.tzinfo)
         end_time_iso = end_dt.isoformat()
     else:
-        # All-day (date only)
         end_timezone = None
         end_time_iso = end_dt.isoformat()
 
     event_body = {
-        "summary": "Busy",
+        "summary": "Busy",  # obfuscated summary
         "start": (
             {
                 "dateTime": start_time_iso,
-                "timeZone": start_timezone if start_timezone else default_timezone,
+                "timeZone": start_timezone or default_timezone,
             }
             if start_timezone
             else {"date": start_time_iso}
@@ -237,7 +232,7 @@ def obfuscate_event(event):
         "end": (
             {
                 "dateTime": end_time_iso,
-                "timeZone": end_timezone if end_timezone else default_timezone,
+                "timeZone": end_timezone or default_timezone,
             }
             if end_timezone
             else {"date": end_time_iso}
@@ -245,37 +240,51 @@ def obfuscate_event(event):
         "transparency": "opaque",
         "extendedProperties": {
             "private": {
-                "icloud_uid": event.vobject_instance.vevent.uid.value,
-                "icloud_etag": event.etag,
+                "icloud_uid": vevent.uid.value,
+                "icloud_etag": etag,
             }
         },
     }
 
-    # Handle recurrence
-    if hasattr(event.vobject_instance.vevent, "rrule"):
-        event_body["recurrence"] = convert_recurrence(event.vobject_instance.vevent)
-
     return event_body
 
 
-def is_all_day_event(event):
+def convert_overrides_to_exdates(master_rrule_list, overrides):
     """
-    Determine if the iCloud event is an all-day event.
+    Take a master event's recurrence list (already containing RRULE & any EXDATE)
+    and append additional EXDATE lines for each override's RECURRENCE-ID date.
 
-    :param event: A caldav Event object with vobject instance data.
-    :return: True if the event has a date-only start time, otherwise False.
+    Returns the updated recurrence list.
     """
-    start_dt = event.vobject_instance.vevent.dtstart.value
-    return not isinstance(start_dt, datetime)
+    if not master_rrule_list:
+        master_rrule_list = []
+
+    for override_vevent in overrides:
+        # 'recurrence_id' is the *original* date/time for that instance
+        if hasattr(override_vevent, "recurrence_id"):
+            override_dt = override_vevent.recurrence_id.value
+            override_params = getattr(override_vevent.recurrence_id, "params", {})
+            exdate_str = _format_exdate(override_dt, override_params)
+            master_rrule_list.append(exdate_str)
+
+    return master_rrule_list
+
+
+def is_all_day_vevent(vevent):
+    """
+    Check if the VEVENT is all-day by examining its dtstart value.
+    """
+    dtstart = vevent.dtstart.value
+    return not isinstance(dtstart, datetime)
 
 
 def fetch_icloud_events():
     """
     Fetch events from iCloud calendars (skipping those in the skip list), within the next
-    DAYS_TO_SYNC days. Event objects have their etag loaded for use in extended properties
-    when creating Google events.
+    DAYS_TO_SYNC days. Each event object may have multiple VEVENT components if it’s recurring
+    with overrides.
 
-    :return: Dictionary mapping calendar names to lists of caldav Event objects.
+    :return: Dictionary mapping calendar names to lists of caldav.Event objects.
     """
     calendars_events = {}
     principal = ICLOUD_CLIENT.principal()
@@ -310,52 +319,102 @@ def fetch_icloud_events():
 
 def add_icloud_events_to_google(service, calendars_events):
     """
-    Insert obfuscated iCloud events into the Google Calendar.
-
-    :param service: Authenticated Google Calendar API service object.
-    :param calendars_events: Dictionary of {calendar_name: [caldav Event, ...]}.
+    Insert obfuscated iCloud events into the Google Calendar, properly handling:
+      - Master recurring VEVENT
+      - Override VEVENTs with RECURRENCE-ID (converted to EXDATE + separate single events)
+      - Skips all-day events in calendars not whitelisted for all-day.
     """
     print("Adding iCloud events to Google Calendar...")
+
     for calendar_name, events in calendars_events.items():
         print(f"Processing calendar: {calendar_name}")
+
         for event in events:
-            # Skip all-day events if the calendar is not allowed to have them
-            if is_all_day_event(event) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
-                print(f"Ignoring all-day event in calendar {calendar_name}")
+            # Split into sub-components: master vs. overrides
+            vevents = [c for c in event.vobject_instance.components() if c.name == "VEVENT"]
+            if not vevents:
                 continue
 
-            obfuscated_event = obfuscate_event(event)
-            try:
-                service.events().insert(
-                    calendarId=GOOGLE_CALENDAR_ID,
-                    body=obfuscated_event
-                ).execute()
-            except Exception as e:
-                uid = event.vobject_instance.vevent.uid.value
-                print(f"Error creating event with UID {uid}: {e}")
+            # Identify the master VEVENT (no RECURRENCE-ID) and any overrides
+            master_vevent = None
+            override_vevents = []
+
+            for vevent in vevents:
+                if hasattr(vevent, "recurrence_id"):
+                    override_vevents.append(vevent)
+                else:
+                    master_vevent = vevent
+
+            # If there's no master, it might be a single non-recurring event
+            # or an odd case where everything is an override. Handle gracefully:
+            if not master_vevent and len(override_vevents) == 1:
+                # Possibly a single VEVENT that’s actually an override
+                master_vevent = override_vevents[0]
+                override_vevents = []
+
+            # Obfuscate each sub-VEVENT accordingly
+            if master_vevent:
+                # Skip if master is an all-day in a non-whitelisted calendar
+                if is_all_day_vevent(master_vevent) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
+                    print(f"Ignoring all-day recurring event in calendar {calendar_name}")
+                    continue
+
+                # Build the recurring event from the master
+                master_body = obfuscate_vevent(master_vevent, event.etag)
+
+                # If the master has an RRULE, convert it to a Google recurrence
+                # plus incorporate exdates from the master:
+                master_rrule_list = convert_master_recurrence(master_vevent)
+
+                # Now add EXDATE for each override's original date/time
+                master_rrule_list = convert_overrides_to_exdates(master_rrule_list, override_vevents)
+                if master_rrule_list:
+                    master_body["recurrence"] = master_rrule_list
+
+                # Insert the recurring event
+                try:
+                    service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=master_body).execute()
+                except Exception as e:
+                    print(f"Error creating master recurring event with UID {master_vevent.uid.value}: {e}")
+
+            # For each override, create a separate single event to reflect the changed times
+            for ov_vevent in override_vevents:
+                # Possibly skip if override is an all-day but not allowed
+                if is_all_day_vevent(ov_vevent) and calendar_name not in ICLOUD_CALENDARS_ALLOW_FULL_DAY_EVENTS:
+                    print(f"Ignoring all-day override event in calendar {calendar_name}")
+                    continue
+
+                single_body = obfuscate_vevent(ov_vevent, event.etag)
+                # This single event is not recurring (it’s just one day)
+                # so no 'recurrence' property is needed here.
+
+                try:
+                    service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=single_body).execute()
+                except Exception as e:
+                    print(f"Error creating override event with UID {ov_vevent.uid.value}: {e}")
 
 
 def main():
     """
-    Main script entry point. Authenticates with Google, deletes existing events (if allowed),
-    fetches iCloud events, and adds them to the Google Calendar with obfuscation.
+    Main script entry point. Authenticates with Google, fetches iCloud events first,
+    then deletes existing Google events (if allowed), and adds iCloud events to Google.
     """
     start_time = time.time()
 
-    # Authenticate with Google
+    # 1) Authenticate with Google
     creds = authenticate_google()
     service = build("calendar", "v3", credentials=creds)
 
-    # 1) Optionally delete all events from the Google Calendar
+    # 2) Fetch iCloud events BEFORE deleting Google events
+    calendars_events = fetch_icloud_events()
+
+    # 3) Optionally delete all events from the Google Calendar
     if GOOGLE_CALENDAR_ID not in GOOGLE_CALENDARS_TO_SKIP_DELETION:
         delete_all_events_from_google(service, GOOGLE_CALENDAR_ID)
     else:
         print(f"Skipping deletion for {GOOGLE_CALENDAR_ID} (in skip-deletion list).")
 
-    # 2) Fetch iCloud events
-    calendars_events = fetch_icloud_events()
-
-    # 3) Add iCloud events to Google Calendar
+    # 4) Add iCloud events to Google Calendar
     add_icloud_events_to_google(service, calendars_events)
 
     # Wrap up timing
